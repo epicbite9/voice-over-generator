@@ -15,6 +15,7 @@ import streamlit as st
 
 CONFIG_PATH = ".tutorial_sync_config.json"
 OUTPUT_PATH = "pro_demo.mp4"
+EDIT_OUTPUT_PATH = "edited_video.mp4"
 GAP_EPSILON = 0.20
 TARGET_WPS = 2.6
 MIN_RATE_PERCENT = -15
@@ -145,6 +146,15 @@ def transcode_to_safe_mp4(input_path):
         raise RuntimeError(f"FFmpeg transcode failed: {err[-500:]}")
 
     return output_path
+
+
+def save_uploaded_file(uploaded_file, fallback_suffix):
+    _, ext = os.path.splitext(uploaded_file.name or "")
+    ext = ext.lower() if ext else fallback_suffix
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+    tmp.write(uploaded_file.getbuffer())
+    tmp.close()
+    return tmp.name
 
 
 def save_and_prepare_upload(uploaded_video):
@@ -368,6 +378,69 @@ def sync_clip_and_audio(clip, audio_clip):
     return clip, audio_clip
 
 
+def apply_basic_edits(
+    input_video_path,
+    trim_start_sec,
+    trim_end_sec,
+    speed_factor,
+    source_volume,
+    bgm_path=None,
+    bgm_volume=0.25,
+):
+    video = mp.VideoFileClip(input_video_path)
+    bgm_clip = None
+    edited = None
+
+    try:
+        start = max(0.0, float(trim_start_sec))
+        end = float(trim_end_sec) if trim_end_sec > 0 else float(video.duration)
+        end = min(end, float(video.duration))
+        if end <= start + 0.2:
+            raise ValueError("Trim range is too small. Increase end time.")
+
+        edited = video.subclip(start, end)
+
+        speed_factor = max(0.5, min(2.0, float(speed_factor)))
+        if abs(speed_factor - 1.0) > 0.001:
+            edited = edited.fx(mp.vfx.speedx, factor=speed_factor)
+
+        final_audio = edited.audio.volumex(max(0.0, float(source_volume))) if edited.audio else None
+
+        if bgm_path:
+            bgm_clip = mp.AudioFileClip(bgm_path).volumex(max(0.0, float(bgm_volume)))
+            if bgm_clip.duration < edited.duration:
+                bgm_clip = mp.afx.audio_loop(bgm_clip, duration=edited.duration)
+            else:
+                bgm_clip = bgm_clip.subclip(0, edited.duration)
+
+            final_audio = mp.CompositeAudioClip([final_audio, bgm_clip]) if final_audio else bgm_clip
+
+        if final_audio:
+            final_audio = final_audio.fx(mp.afx.audio_fadein, 0.25).fx(mp.afx.audio_fadeout, 0.35)
+            edited = edited.set_audio(final_audio)
+
+        output_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        output_tmp.close()
+        edited_path = output_tmp.name
+        edited.write_videofile(edited_path, codec="libx264", audio_codec="aac", fps=24)
+        return edited_path
+    finally:
+        try:
+            if edited is not None:
+                edited.close()
+        except Exception:
+            pass
+        try:
+            if bgm_clip is not None:
+                bgm_clip.close()
+        except Exception:
+            pass
+        try:
+            video.close()
+        except Exception:
+            pass
+
+
 def assemble_pro_video(original_video_path, script_data, voice_choice):
     video = mp.VideoFileClip(original_video_path)
     segments = []
@@ -410,6 +483,11 @@ default_key = stored.get("gemini_api_key", "")
 
 with st.sidebar:
     st.subheader("Settings")
+    mode = st.radio(
+        "Mode",
+        ["AI Voiceover Sync", "Edit Only (CapCut Lite)"],
+        help="Use AI narration sync, or only perform clean timeline edits.",
+    )
     key = st.text_input("Gemini API Key", type="password", value=default_key)
     save_key = st.checkbox("Remember API key on this computer", value=bool(default_key))
     voice = st.selectbox(
@@ -446,26 +524,80 @@ with col2:
         "- Avoid long dead time between actions"
     )
 
+st.subheader("Quick Edit Controls")
+edit_c1, edit_c2, edit_c3, edit_c4 = st.columns(4)
+with edit_c1:
+    trim_start_sec = st.number_input("Trim Start (sec)", min_value=0.0, value=0.0, step=0.5)
+with edit_c2:
+    trim_end_sec = st.number_input(
+        "Trim End (sec, 0 = full)", min_value=0.0, value=0.0, step=0.5
+    )
+with edit_c3:
+    speed_factor = st.slider("Playback Speed", min_value=0.5, max_value=2.0, value=1.0, step=0.05)
+with edit_c4:
+    source_volume = st.slider("Original Audio Volume", min_value=0.0, max_value=2.0, value=1.0, step=0.05)
 
-if uploaded_video and key and model_name:
-    if st.button("Generate Professional Sync Demo", use_container_width=True):
+bgm_file = st.file_uploader("Optional Background Music", type=["mp3", "wav", "m4a"])
+bgm_volume = st.slider("BGM Volume", min_value=0.0, max_value=1.0, value=0.20, step=0.05)
+
+
+if uploaded_video:
+    run_label = "Render Edited Video" if mode == "Edit Only (CapCut Lite)" else "Generate Professional Sync Demo"
+    can_run_ai = bool(key and model_name)
+    if mode == "AI Voiceover Sync" and not can_run_ai:
+        st.warning("Enter a valid Gemini API key to run AI voice-over mode.")
+
+    if st.button(run_label, use_container_width=True, disabled=(mode == "AI Voiceover Sync" and not can_run_ai)):
         temp_paths = []
         try:
-            with st.status("Analyzing video and generating aligned narration...") as status:
+            status_text = "Applying edits and rendering..." if mode == "Edit Only (CapCut Lite)" else "Analyzing video and generating aligned narration..."
+            with st.status(status_text) as status:
                 st.write("0/3 Preparing video file...")
                 v_path, temp_paths = save_and_prepare_upload(uploaded_video)
+                bgm_path = None
+                if bgm_file:
+                    bgm_path = save_uploaded_file(bgm_file, ".mp3")
+                    temp_paths.append(bgm_path)
 
-                base_video = mp.VideoFileClip(v_path)
+                st.write("1/3 Applying timeline edits...")
+                edited_video_path = apply_basic_edits(
+                    input_video_path=v_path,
+                    trim_start_sec=trim_start_sec,
+                    trim_end_sec=trim_end_sec,
+                    speed_factor=speed_factor,
+                    source_volume=source_volume,
+                    bgm_path=bgm_path,
+                    bgm_volume=bgm_volume,
+                )
+                temp_paths.append(edited_video_path)
+
+                if mode == "Edit Only (CapCut Lite)":
+                    final_edit_path = EDIT_OUTPUT_PATH
+                    with open(edited_video_path, "rb") as src, open(final_edit_path, "wb") as dst:
+                        dst.write(src.read())
+                    status.update(label="Complete", state="complete")
+                    st.success("Edited video created successfully.")
+                    st.video(final_edit_path)
+                    with open(final_edit_path, "rb") as f:
+                        st.download_button(
+                            "Download Edited Video",
+                            f,
+                            file_name="edited_video.mp4",
+                            use_container_width=True,
+                        )
+                    st.stop()
+
+                base_video = mp.VideoFileClip(edited_video_path)
                 duration = float(base_video.duration)
                 base_video.close()
 
-                st.write("1/3 Uploading video for scene analysis...")
-                genai_file = genai.upload_file(path=v_path)
+                st.write("2/3 Uploading video for scene analysis...")
+                genai_file = genai.upload_file(path=edited_video_path)
                 while genai_file.state.name == "PROCESSING":
                     time.sleep(2)
                     genai_file = genai.get_file(genai_file.name)
 
-                st.write("2/3 Creating structured timeline...")
+                st.write("3/3 Creating narration and rendering...")
                 model = genai.GenerativeModel(model_name=model_name)
                 prompt = f"""
 Analyze this UI tutorial video and return JSON only.
@@ -498,8 +630,7 @@ Return format:
                     st.error("Could not parse action timestamps. Try a clearer recording.")
                     st.stop()
 
-                st.write(f"3/3 Rendering final video from {len(script_data)} aligned segments...")
-                final_out = assemble_pro_video(v_path, script_data, voice)
+                final_out = assemble_pro_video(edited_video_path, script_data, voice)
                 status.update(label="Complete", state="complete")
 
             st.success("Professional demo created successfully.")
