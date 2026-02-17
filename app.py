@@ -16,6 +16,9 @@ import streamlit as st
 CONFIG_PATH = ".tutorial_sync_config.json"
 OUTPUT_PATH = "pro_demo.mp4"
 GAP_EPSILON = 0.20
+TARGET_WPS = 2.6
+MIN_RATE_PERCENT = -15
+MAX_RATE_PERCENT = 45
 
 
 st.set_page_config(page_title="Tutorial Sync Studio", layout="wide")
@@ -86,6 +89,13 @@ async def generate_segment_audio(text, output_path, voice):
     await communicate.save(output_path)
 
 
+async def generate_segment_audio_with_rate(text, output_path, voice, rate_percent):
+    rate_percent = max(MIN_RATE_PERCENT, min(MAX_RATE_PERCENT, int(rate_percent)))
+    rate = f"{rate_percent:+d}%"
+    communicate = edge_tts.Communicate(text, voice, rate=rate, volume="+0%")
+    await communicate.save(output_path)
+
+
 def can_read_first_frame(video_path):
     clip = None
     try:
@@ -153,14 +163,17 @@ def save_and_prepare_upload(uploaded_video):
     return safe_path, [raw_tmp.name, safe_path]
 
 
-def parse_segments_from_response(raw_text):
+def parse_json_payload(raw_text):
     text = raw_text.strip()
     json_match = re.search(r"```json\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
     if json_match:
         text = json_match.group(1).strip()
+    return json.loads(text)
 
+
+def parse_segments_from_response(raw_text):
     try:
-        payload = json.loads(text)
+        payload = parse_json_payload(raw_text)
         segments = payload.get("segments", payload) if isinstance(payload, (dict, list)) else []
         out = []
         for item in segments:
@@ -183,6 +196,59 @@ def parse_segments_from_response(raw_text):
         end_sec = int(m[2]) * 60 + float(m[3])
         out.append((start_sec, end_sec, m[4].strip()))
     return out
+
+
+def refine_script_for_professional_voice(model_name, script_data):
+    if not script_data:
+        return script_data
+
+    compact = []
+    for i, (start, end, text) in enumerate(script_data):
+        duration = max(0.4, end - start)
+        target_words = max(4, int(duration * TARGET_WPS))
+        compact.append(
+            {
+                "index": i,
+                "duration_sec": round(duration, 2),
+                "target_words": target_words,
+                "narration": text,
+            }
+        )
+
+    prompt = """
+Rewrite the narration lines to sound like a professional software tutorial voice-over.
+Rules:
+- Keep each line accurate to the original meaning. Do not invent UI elements or actions.
+- Keep style clear, concise, and confident.
+- Keep each line close to target_words so it can be spoken within duration_sec naturally.
+- Return JSON only in this exact format:
+{
+  "segments": [
+    {"index": 0, "narration": "..."}
+  ]
+}
+"""
+    try:
+        model = genai.GenerativeModel(model_name=model_name)
+        response = model.generate_content([prompt, json.dumps(compact)])
+        payload = parse_json_payload(response.text)
+        items = payload.get("segments", []) if isinstance(payload, dict) else []
+        updates = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            idx = item.get("index")
+            narration = str(item.get("narration", "")).strip()
+            if isinstance(idx, int) and narration:
+                updates[idx] = narration
+        if not updates:
+            return script_data
+        refined = []
+        for i, (start, end, text) in enumerate(script_data):
+            refined.append((start, end, updates.get(i, text)))
+        return refined
+    except Exception:
+        return script_data
 
 
 def normalize_segments(script_data, video_duration):
@@ -253,6 +319,36 @@ def ensure_full_coverage(script_data, video_duration):
     return adjusted
 
 
+def measure_audio_duration(audio_path):
+    audio = None
+    try:
+        audio = mp.AudioFileClip(audio_path)
+        return float(audio.duration)
+    finally:
+        if audio is not None:
+            audio.close()
+
+
+def build_timed_audio(text, audio_path, voice_choice, target_duration):
+    rate_percent = 0
+    best_diff = float("inf")
+    for _ in range(3):
+        asyncio.run(generate_segment_audio_with_rate(text, audio_path, voice_choice, rate_percent))
+        current_duration = measure_audio_duration(audio_path)
+        diff = abs(current_duration - target_duration)
+        if diff < best_diff:
+            best_diff = diff
+        if diff <= 0.22:
+            break
+
+        speed_factor = current_duration / max(0.2, target_duration)
+        desired_adjust = int((speed_factor - 1.0) * 80)
+        next_rate = max(MIN_RATE_PERCENT, min(MAX_RATE_PERCENT, rate_percent + desired_adjust))
+        if next_rate == rate_percent:
+            break
+        rate_percent = next_rate
+
+
 def add_silence_padding(audio_clip, target_duration):
     pad = target_duration - audio_clip.duration
     if pad <= 0.05:
@@ -285,7 +381,7 @@ def assemble_pro_video(original_video_path, script_data, voice_choice):
 
             clip = video.subclip(start_t, end_t)
             audio_seg_path = f"seg_{i}.mp3"
-            asyncio.run(generate_segment_audio(text, audio_seg_path, voice_choice))
+            build_timed_audio(text, audio_seg_path, voice_choice, clip.duration)
             temp_audio_files.append(audio_seg_path)
             audio_seg = mp.AudioFileClip(audio_seg_path)
 
@@ -318,7 +414,13 @@ with st.sidebar:
     save_key = st.checkbox("Remember API key on this computer", value=bool(default_key))
     voice = st.selectbox(
         "Narrator Voice",
-        ["en-US-GuyNeural", "en-US-AvaNeural", "en-GB-SoniaNeural", "en-US-JennyNeural"],
+        [
+            "en-US-AndrewMultilingualNeural",
+            "en-US-AvaNeural",
+            "en-US-GuyNeural",
+            "en-US-JennyNeural",
+            "en-GB-SoniaNeural",
+        ],
     )
 
     if key and save_key and key != default_key:
@@ -373,6 +475,8 @@ Requirements:
 - Narration must fit naturally within each segment duration.
 - Cover the video from start to finish with no overlap.
 - Keep narration concise, professional, and tool-focused.
+- Be visually grounded: describe only actions clearly visible on screen.
+- Use an instructional voice-over tone, like a polished product demo.
 - Total video duration is approximately {duration:.2f} seconds.
 
 Return format:
@@ -385,6 +489,7 @@ Return format:
                 response = model.generate_content([genai_file, prompt])
                 script_data = parse_segments_from_response(response.text)
                 script_data = ensure_full_coverage(script_data, duration)
+                script_data = refine_script_for_professional_voice(model_name, script_data)
                 cov = coverage_ratio(script_data, duration)
                 if cov < 0.95:
                     script_data = ensure_full_coverage([], duration)
