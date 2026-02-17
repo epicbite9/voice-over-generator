@@ -2,11 +2,13 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import tempfile
 import time
 
 import edge_tts
 import google.generativeai as genai
+import imageio_ffmpeg
 import moviepy.editor as mp
 import streamlit as st
 
@@ -81,6 +83,73 @@ def get_best_model(api_key):
 async def generate_segment_audio(text, output_path, voice):
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(output_path)
+
+
+def can_read_first_frame(video_path):
+    clip = None
+    try:
+        clip = mp.VideoFileClip(video_path)
+        clip.get_frame(0)
+        return True
+    except Exception:
+        return False
+    finally:
+        if clip is not None:
+            clip.close()
+
+
+def transcode_to_safe_mp4(input_path):
+    ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+    out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    out_tmp.close()
+    output_path = out_tmp.name
+
+    command = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        input_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or "").strip()
+        raise RuntimeError(f"FFmpeg transcode failed: {err[-500:]}")
+
+    return output_path
+
+
+def save_and_prepare_upload(uploaded_video):
+    _, ext = os.path.splitext(uploaded_video.name or "")
+    ext = ext.lower() if ext else ".mp4"
+    raw_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+    raw_tmp.write(uploaded_video.getbuffer())
+    raw_tmp.close()
+
+    if can_read_first_frame(raw_tmp.name):
+        return raw_tmp.name, [raw_tmp.name]
+
+    safe_path = transcode_to_safe_mp4(raw_tmp.name)
+    if not can_read_first_frame(safe_path):
+        raise RuntimeError("Uploaded video could not be decoded even after transcode.")
+    return safe_path, [raw_tmp.name, safe_path]
 
 
 def parse_segments_from_response(raw_text):
@@ -230,11 +299,11 @@ with col2:
 
 if uploaded_video and key and model_name:
     if st.button("Generate Professional Sync Demo", use_container_width=True):
+        temp_paths = []
         try:
             with st.status("Analyzing video and generating aligned narration...") as status:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-                    tmp.write(uploaded_video.read())
-                    v_path = tmp.name
+                st.write("0/3 Preparing video file...")
+                v_path, temp_paths = save_and_prepare_upload(uploaded_video)
 
                 base_video = mp.VideoFileClip(v_path)
                 duration = float(base_video.duration)
@@ -289,3 +358,9 @@ Return format:
 
         except Exception as e:
             st.error(f"Error: {e}")
+        finally:
+            for p in temp_paths:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
