@@ -367,6 +367,19 @@ def add_silence_padding(audio_clip, target_duration):
     return mp.concatenate_audioclips([audio_clip, silence])
 
 
+def shift_audio_to_timeline(audio_clip, shift_sec, video_duration):
+    shift_sec = float(shift_sec)
+    clip = audio_clip
+    if shift_sec < -0.01:
+        trim = min(abs(shift_sec), max(0.0, clip.duration - 0.01))
+        clip = clip.subclip(trim, clip.duration)
+        shift_sec = 0.0
+    clip = clip.set_start(max(0.0, shift_sec))
+    timeline_silence = mp.AudioClip(lambda t: 0, duration=video_duration, fps=44100)
+    mixed = mp.CompositeAudioClip([timeline_silence, clip]).set_duration(video_duration)
+    return mixed
+
+
 def apply_voice_cut(audio_clip, cut_start, cut_end, mode):
     total = float(audio_clip.duration)
     cut_start = max(0.0, min(float(cut_start), total))
@@ -478,7 +491,7 @@ def assemble_pro_video(
             seg_duration = max(0.35, end_t - start_t)
             build_timed_audio(text, audio_seg_path, voice_choice, seg_duration)
             temp_audio_files.append(audio_seg_path)
-            audio_seg = mp.AudioFileClip(audio_seg_path).set_start(start_t).volumex(voice_layer_volume)
+            audio_seg = mp.AudioFileClip(audio_seg_path).set_start(start_t)
             voice_segment_clips.append(audio_seg)
 
         if not voice_segment_clips:
@@ -489,9 +502,8 @@ def assemble_pro_video(
         if enable_voice_cut:
             voice_track = apply_voice_cut(voice_track, voice_cut_start_sec, voice_cut_end_sec, voice_cut_mode)
 
-        voice_track = voice_track.set_start(voice_layer_shift_sec)
-        if voice_track.duration < video.duration:
-            voice_track = add_silence_padding(voice_track, video.duration)
+        voice_track = voice_track.volumex(max(0.0, float(voice_layer_volume)))
+        voice_track = shift_audio_to_timeline(voice_track, voice_layer_shift_sec, float(video.duration))
 
         final_video = base_silent_video.set_audio(voice_track)
         final_video.write_videofile(OUTPUT_PATH, codec="libx264", audio_codec="aac", fps=24)
@@ -600,6 +612,13 @@ with edit_c4:
 
 bgm_file = st.file_uploader("Optional Background Music", type=["mp3", "wav", "m4a"])
 bgm_volume = st.slider("BGM Volume", min_value=0.0, max_value=1.0, value=0.20, step=0.05)
+
+if mode == "AI Voiceover Sync":
+    st.caption(
+        f"Layers active: Video Base (silent) + Voice Layer "
+        f"(shift {voice_layer_shift_sec:+.1f}s, volume x{voice_layer_volume:.2f}, "
+        f"cut {'on' if enable_voice_cut else 'off'})."
+    )
 
 
 if uploaded_video:
