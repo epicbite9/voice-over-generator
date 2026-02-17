@@ -367,15 +367,25 @@ def add_silence_padding(audio_clip, target_duration):
     return mp.concatenate_audioclips([audio_clip, silence])
 
 
-def sync_clip_and_audio(clip, audio_clip):
-    if audio_clip.duration > clip.duration + 0.08:
-        freeze_duration = audio_clip.duration - clip.duration
-        freeze_frame = clip.get_frame(max(0.0, clip.duration - 0.02))
-        freeze_clip = mp.ImageClip(freeze_frame).set_duration(freeze_duration)
-        clip = mp.concatenate_videoclips([clip, freeze_clip], method="compose")
-    elif clip.duration > audio_clip.duration + 0.08:
-        audio_clip = add_silence_padding(audio_clip, clip.duration)
-    return clip, audio_clip
+def apply_voice_cut(audio_clip, cut_start, cut_end, mode):
+    total = float(audio_clip.duration)
+    cut_start = max(0.0, min(float(cut_start), total))
+    cut_end = max(cut_start, min(float(cut_end), total))
+    if cut_end - cut_start < 0.05:
+        return audio_clip
+
+    before = audio_clip.subclip(0, cut_start) if cut_start > 0 else None
+    after = audio_clip.subclip(cut_end, total) if cut_end < total else None
+
+    if mode == "remove":
+        parts = [p for p in [before, after] if p is not None]
+        if not parts:
+            return mp.AudioClip(lambda t: 0, duration=0.1, fps=44100)
+        return mp.concatenate_audioclips(parts)
+
+    silence = mp.AudioClip(lambda t: 0, duration=cut_end - cut_start, fps=44100)
+    parts = [p for p in [before, silence, after] if p is not None]
+    return mp.concatenate_audioclips(parts)
 
 
 def apply_basic_edits(
@@ -441,35 +451,58 @@ def apply_basic_edits(
             pass
 
 
-def assemble_pro_video(original_video_path, script_data, voice_choice):
+def assemble_pro_video(
+    original_video_path,
+    script_data,
+    voice_choice,
+    voice_layer_shift_sec=0.0,
+    voice_layer_volume=1.0,
+    enable_voice_cut=False,
+    voice_cut_start_sec=0.0,
+    voice_cut_end_sec=0.0,
+    voice_cut_mode="mute",
+):
     video = mp.VideoFileClip(original_video_path)
-    segments = []
     temp_audio_files = []
+    voice_segment_clips = []
 
     try:
+        base_silent_video = video.without_audio()
+
         for i, entry in enumerate(script_data):
             start_t, end_t, text = entry
             if end_t <= start_t:
                 continue
 
-            clip = video.subclip(start_t, end_t)
             audio_seg_path = f"seg_{i}.mp3"
-            build_timed_audio(text, audio_seg_path, voice_choice, clip.duration)
+            seg_duration = max(0.35, end_t - start_t)
+            build_timed_audio(text, audio_seg_path, voice_choice, seg_duration)
             temp_audio_files.append(audio_seg_path)
-            audio_seg = mp.AudioFileClip(audio_seg_path)
+            audio_seg = mp.AudioFileClip(audio_seg_path).set_start(start_t).volumex(voice_layer_volume)
+            voice_segment_clips.append(audio_seg)
 
-            clip, audio_seg = sync_clip_and_audio(clip, audio_seg)
-            clip = clip.set_audio(audio_seg)
-            segments.append(clip)
-
-        if not segments:
+        if not voice_segment_clips:
             raise ValueError("No valid segments were produced.")
 
-        final_video = mp.concatenate_videoclips(segments, method="compose")
+        voice_track = mp.CompositeAudioClip(voice_segment_clips).set_duration(video.duration)
+
+        if enable_voice_cut:
+            voice_track = apply_voice_cut(voice_track, voice_cut_start_sec, voice_cut_end_sec, voice_cut_mode)
+
+        voice_track = voice_track.set_start(voice_layer_shift_sec)
+        if voice_track.duration < video.duration:
+            voice_track = add_silence_padding(voice_track, video.duration)
+
+        final_video = base_silent_video.set_audio(voice_track)
         final_video.write_videofile(OUTPUT_PATH, codec="libx264", audio_codec="aac", fps=24)
         final_video.close()
         return OUTPUT_PATH
     finally:
+        for c in voice_segment_clips:
+            try:
+                c.close()
+            except Exception:
+                pass
         for p in temp_audio_files:
             try:
                 os.remove(p)
@@ -511,6 +544,34 @@ with st.sidebar:
         st.warning("No compatible Gemini model found for this key.")
     elif model_name:
         st.caption(f"Using model: `{model_name}`")
+
+    st.markdown("---")
+    st.subheader("Layer Mixer")
+    st.caption("Layer 1: Main Video (silent base)")
+    st.caption("Layer 2: Voiceover Script Audio")
+    voice_layer_shift_sec = st.slider(
+        "Move Voice Layer (sec)",
+        min_value=-10.0,
+        max_value=10.0,
+        value=0.0,
+        step=0.1,
+        help="Move the full voice layer earlier/later on the timeline.",
+    )
+    voice_layer_volume = st.slider(
+        "Voice Layer Volume",
+        min_value=0.0,
+        max_value=2.0,
+        value=1.0,
+        step=0.05,
+    )
+    enable_voice_cut = st.checkbox("Cut Voice Layer Range", value=False)
+    voice_cut_start_sec = st.number_input("Voice Cut Start (sec)", min_value=0.0, value=0.0, step=0.5)
+    voice_cut_end_sec = st.number_input("Voice Cut End (sec)", min_value=0.0, value=0.0, step=0.5)
+    voice_cut_mode_label = st.selectbox(
+        "Voice Cut Behavior",
+        ["Mute only (keep timing)", "Remove and shift left"],
+    )
+    voice_cut_mode = "remove" if voice_cut_mode_label.startswith("Remove") else "mute"
 
 
 col1, col2 = st.columns([1.5, 1])
@@ -630,7 +691,17 @@ Return format:
                     st.error("Could not parse action timestamps. Try a clearer recording.")
                     st.stop()
 
-                final_out = assemble_pro_video(edited_video_path, script_data, voice)
+                final_out = assemble_pro_video(
+                    edited_video_path,
+                    script_data,
+                    voice,
+                    voice_layer_shift_sec=voice_layer_shift_sec,
+                    voice_layer_volume=voice_layer_volume,
+                    enable_voice_cut=enable_voice_cut,
+                    voice_cut_start_sec=voice_cut_start_sec,
+                    voice_cut_end_sec=voice_cut_end_sec,
+                    voice_cut_mode=voice_cut_mode,
+                )
                 status.update(label="Complete", state="complete")
 
             st.success("Professional demo created successfully.")
