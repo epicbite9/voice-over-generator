@@ -1,6 +1,6 @@
 import asyncio
-import json
 import os
+import json
 import re
 import tempfile
 import time
@@ -11,123 +11,91 @@ import moviepy.editor as mp
 import numpy as np
 import streamlit as st
 
-# Setup FFmpeg path
+# Setup FFmpeg
 os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
 
-CONFIG_PATH = ".tutorial_sync_config.json"
-OUTPUT_PATH = "final_output.mp4"
+# --- THEME & CSS ---
+st.set_page_config(page_title="AI Video Editor", layout="wide", initial_sidebar_state="collapsed")
 
-# Initialize session state
+st.markdown("""
+<style>
+    /* CapCut-style Editor Theme */
+    .stApp { background-color: #0e0e10; color: #efeff1; }
+    .main { background-color: #0e0e10; }
+    
+    /* Timeline Container */
+    .timeline-track {
+        background: #1c1c1f;
+        border-radius: 8px;
+        padding: 15px;
+        margin: 20px 0;
+        min-height: 80px;
+        display: flex;
+        position: relative;
+        overflow-x: auto;
+        border: 1px solid #333;
+    }
+    
+    /* Individual Clip style */
+    .clip-block {
+        background: linear-gradient(90deg, #3182ce, #63b3ed);
+        border: 1px solid #fff;
+        border-radius: 4px;
+        height: 40px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-size: 10px;
+        font-weight: bold;
+        position: absolute;
+        cursor: pointer;
+        transition: all 0.2s;
+        white-space: nowrap;
+        overflow: hidden;
+    }
+    .clip-block:hover { filter: brightness(1.2); transform: translateY(-2px); }
+    .clip-active { border: 2px solid #ffcc00 !important; box-shadow: 0 0 10px #ffcc00; }
+    
+    /* Control Bar */
+    .editor-card {
+        background: #18181b;
+        padding: 20px;
+        border-radius: 12px;
+        border: 1px solid #2d2d30;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# --- STATE MANAGEMENT ---
 if 'segments' not in st.session_state: st.session_state.segments = []
 if 'video_path' not in st.session_state: st.session_state.video_path = None
-if 'video_duration' not in st.session_state: st.session_state.video_duration = 0.0
-if 'bg_music' not in st.session_state: st.session_state.bg_music = None
-if 'bg_music_volume' not in st.session_state: st.session_state.bg_music_volume = 0.15
+if 'video_duration' not in st.session_state: st.session_state.video_duration = 10.0
+if 'selected_idx' not in st.session_state: st.session_state.selected_idx = 0
 if 'video_start' not in st.session_state: st.session_state.video_start = 0.0
-if 'video_end' not in st.session_state: st.session_state.video_end = 0.0
+if 'video_end' not in st.session_state: st.session_state.video_end = 10.0
+if 'bg_music' not in st.session_state: st.session_state.bg_music = None
 
-st.set_page_config(page_title="AI Tutorial Sync", layout="wide")
-
-# ==================== VOICE OVER ENGINE ==================== #
-
+# --- AUDIO ENGINE ---
 async def save_voice(text, path, voice, rate, pitch):
-    """Core function to generate the MP3 file via edge-tts"""
     communicate = edge_tts.Communicate(text, voice, rate=f"{int(rate):+d}%", pitch=f"{int(pitch):+d}%")
     await communicate.save(path)
 
-def generate_voice_segment(text, voice, target_duration, rate_offset=0, pitch=0):
-    """Generates audio and stretches/shrinks it to fit the segment timing"""
-    temp_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
+def generate_voice_file(text, voice, target_duration, rate=0, pitch=0):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
+    asyncio.run(save_voice(text, tmp, voice, rate, pitch))
+    return tmp
+
+# --- UI LAYOUT ---
+st.title("🎬 AI Editor Pro")
+
+# Top Layout: Preview + Inspector
+col_prev, col_insp = st.columns([3, 2])
+
+with col_prev:
+    st.markdown("### 📺 Preview")
+    up = st.file_uploader("Import Media", type=["mp4", "mov"], label_visibility="collapsed")
     
-    # Attempt to match duration by adjusting rate
-    current_rate = rate_offset
-    for attempt in range(2):
-        asyncio.run(save_voice(text, temp_mp3, voice, current_rate, pitch))
-        audio_clip = mp.AudioFileClip(temp_mp3)
-        actual_dur = audio_clip.duration
-        audio_clip.close()
-        
-        if abs(actual_dur - target_duration) < 0.3:
-            break
-        # Calculate new rate to match target
-        speed_factor = actual_dur / max(0.1, target_duration)
-        current_rate += int((speed_factor - 1.0) * 70)
-    
-    return temp_mp3
-
-# ==================== VIDEO ASSEMBLY ==================== #
-
-def assemble_video():
-    if not st.session_state.video_path or not st.session_state.segments:
-        return None
-
-    with st.status("🎬 Processing Video & Generating Voice-overs...") as status:
-        # 1. Load and trim base video
-        video = mp.VideoFileClip(st.session_state.video_path)
-        video = video.subclip(st.session_state.video_start, st.session_state.video_end).without_audio()
-        
-        voice_clips = []
-        temp_files = []
-
-        # 2. Generate and place audio for each segment
-        for i, seg in enumerate(st.session_state.segments):
-            if not seg['text'].strip(): continue
-            
-            status.write(f"Generating audio for Segment {i+1}...")
-            dur = max(0.2, seg['end'] - seg['start'])
-            
-            # Create the audio file
-            mp3_path = generate_voice_segment(seg['text'], seg['voice'], dur, seg['rate'], seg['pitch'])
-            temp_files.append(mp3_path)
-            
-            # Create moviepy clip
-            a_clip = mp.AudioFileClip(mp3_path)
-            # Position relative to trimmed video start
-            start_rel = max(0, seg['start'] - st.session_state.video_start)
-            a_clip = a_clip.set_start(start_rel)
-            voice_clips.append(a_clip)
-
-        # 3. Combine Audio
-        if voice_clips:
-            voice_track = mp.CompositeAudioClip(voice_clips).set_duration(video.duration)
-        else:
-            voice_track = None
-
-        # 4. Background Music
-        final_audio = voice_track
-        if st.session_state.bg_music and os.path.exists(st.session_state.bg_music):
-            bg = mp.AudioFileClip(st.session_state.bg_music)
-            if bg.duration < video.duration:
-                bg = mp.concatenate_audioclips([bg] * int(np.ceil(video.duration / bg.duration)))
-            bg = bg.subclip(0, video.duration).volumex(st.session_state.bg_music_volume)
-            final_audio = mp.CompositeAudioClip([bg, voice_track]) if voice_track else bg
-
-        # 5. Write Output
-        final_video = video.set_audio(final_audio)
-        final_video.write_videofile(OUTPUT_PATH, codec="libx264", audio_codec="aac", fps=24, logger=None)
-        
-        # Cleanup
-        video.close()
-        final_video.close()
-        for f in temp_files: 
-            try: os.remove(f)
-            except: pass
-            
-        return OUTPUT_PATH
-
-# ==================== STREAMLIT UI ==================== #
-
-st.title("🎙️ AI Video Narrator")
-
-with st.sidebar:
-    key = st.text_input("Gemini API Key", type="password")
-    voice_list = ["en-US-JennyNeural", "en-US-GuyNeural", "en-GB-SoniaNeural", "en-AU-NatashaNeural"]
-    sel_voice = st.selectbox("Global Voice", voice_list, index=0)
-
-tabs = st.tabs(["📁 Video", "📝 Segments", "🎶 Audio", "🚀 Export"])
-
-with tabs[0]:
-    up = st.file_uploader("Upload Tutorial Video", type=["mp4", "mov"])
     if up:
         if st.session_state.video_path is None:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as t:
@@ -138,39 +106,96 @@ with tabs[0]:
             st.session_state.video_end = v.duration
             v.close()
         st.video(st.session_state.video_path)
-        
-        m_dur = float(st.session_state.video_duration)
-        st.session_state.video_start = st.slider("Trim Start", 0.0, m_dur, st.session_state.video_start)
-        st.session_state.video_end = st.slider("Trim End", 0.0, m_dur, st.session_state.video_end)
+    else:
+        st.info("Please upload a video to begin editing.")
 
-with tabs[1]:
-    if st.session_state.video_path:
-        if st.button("➕ Add Segment"):
-            st.session_state.segments.append({'start': 0.0, 'end': 2.0, 'text': '', 'voice': sel_voice, 'rate': 0, 'pitch': 0})
-        
-        for i, s in enumerate(st.session_state.segments):
-            with st.expander(f"Segment {i+1}"):
-                s['text'] = st.text_area("Narration", s['text'], key=f"txt_{i}")
+with col_insp:
+    st.markdown("### ⚙️ Inspector")
+    with st.container(border=True):
+        if st.session_state.segments:
+            idx = st.session_state.selected_idx
+            if idx < len(st.session_state.segments):
+                seg = st.session_state.segments[idx]
+                st.markdown(f"**Editing Clip #{idx+1}**")
+                seg['text'] = st.text_area("Narration Script", seg['text'], key=f"edit_txt_{idx}")
+                
                 c1, c2 = st.columns(2)
-                s['start'] = c1.number_input("Start (s)", value=float(s['start']), key=f"s_{i}")
-                s['end'] = c2.number_input("End (s)", value=float(s['end']), key=f"e_{i}")
-                s['voice'] = st.selectbox("Voice", voice_list, index=voice_list.index(s['voice']), key=f"v_{i}")
-                if st.button("🗑️ Delete", key=f"del_{i}"):
-                    st.session_state.segments.pop(i); st.rerun()
+                seg['start'] = c1.number_input("Start Time (s)", 0.0, float(st.session_state.video_duration), float(seg['start']), 0.1, key=f"edit_s_{idx}")
+                seg['end'] = c2.number_input("End Time (s)", 0.0, float(st.session_state.video_duration), float(seg['end']), 0.1, key=f"edit_e_{idx}")
+                
+                v1, v2 = st.columns(2)
+                voice_list = ["en-US-JennyNeural", "en-US-GuyNeural", "en-GB-SoniaNeural"]
+                seg['voice'] = v1.selectbox("Voice", voice_list, index=voice_list.index(seg['voice']), key=f"edit_v_{idx}")
+                seg['rate'] = v2.slider("Speed Offset", -20, 50, int(seg['rate']), key=f"edit_r_{idx}")
+                
+                if st.button("🗑️ Delete Clip", use_container_width=True):
+                    st.session_state.segments.pop(idx)
+                    st.rerun()
+        else:
+            st.write("No clips selected. Add a clip in the timeline.")
 
-with tabs[2]:
-    bg_up = st.file_uploader("Upload Background MP3", type=["mp3"])
-    if bg_up:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as t:
-            t.write(bg_up.getbuffer())
-            st.session_state.bg_music = t.name
-    st.session_state.bg_music_volume = st.slider("Music Volume", 0.0, 1.0, 0.15)
+# Bottom Layout: Timeline
+st.markdown("---")
+st.markdown("### 🎞️ Timeline")
 
-with tabs[3]:
-    if st.button("🚀 Generate Final Video", type="primary"):
-        path = assemble_video()
-        if path:
-            st.success("Done!")
-            st.video(path)
-            with open(path, "rb") as f:
-                st.download_button("Download Video", f, "tutorial.mp4")
+# Timeline Visualizer
+if st.session_state.video_path:
+    total_w = 100 # percentage
+    dur = max(1.0, st.session_state.video_duration)
+    
+    # HTML Timeline Construction
+    timeline_html = f'<div class="timeline-track">'
+    for i, s in enumerate(st.session_state.segments):
+        left = (s['start'] / dur) * 100
+        width = ((s['end'] - s['start']) / dur) * 100
+        active_class = "clip-active" if i == st.session_state.selected_idx else ""
+        timeline_html += f'<div class="clip-block {active_class}" style="left:{left}%; width:{width}%;">Clip {i+1}</div>'
+    timeline_html += '</div>'
+    st.markdown(timeline_html, unsafe_allow_html=True)
+
+# Timeline Buttons
+t_col1, t_col2, t_col3, t_col4 = st.columns([1,1,1,2])
+with t_col1:
+    if st.button("➕ Add Clip"):
+        st.session_state.segments.append({'start': 0.0, 'end': 2.0, 'text': 'Hello world', 'voice': 'en-US-JennyNeural', 'rate': 0, 'pitch': 0})
+        st.session_state.selected_idx = len(st.session_state.segments) - 1
+        st.rerun()
+with t_col2:
+    if st.session_state.segments:
+        options = [f"Clip {i+1}" for i in range(len(st.session_state.segments))]
+        sel = st.selectbox("Select Clip", options, index=st.session_state.selected_idx, label_visibility="collapsed")
+        st.session_state.selected_idx = options.index(sel)
+with t_col4:
+    if st.button("🚀 EXPORT FINAL VIDEO", type="primary", use_container_width=True):
+        # ASSEMBLY LOGIC
+        with st.status("Assembling Project...") as status:
+            video = mp.VideoFileClip(st.session_state.video_path).without_audio()
+            voice_clips = []
+            temp_files = []
+            for i, seg in enumerate(st.session_state.segments):
+                if not seg['text'].strip(): continue
+                path = generate_voice_file(seg['text'], seg['voice'], 0, seg['rate'], 0)
+                temp_files.append(path)
+                a_clip = mp.AudioFileClip(path).set_start(seg['start'])
+                voice_clips.append(a_clip)
+            
+            final_audio = mp.CompositeAudioClip(voice_clips).set_duration(video.duration)
+            final_video = video.set_audio(final_audio)
+            final_video.write_videofile("capcut_export.mp4", codec="libx264", audio_codec="aac", fps=24, logger=None)
+            
+            st.video("capcut_export.mp4")
+            with open("capcut_export.mp4", "rb") as f:
+                st.download_button("Download Export", f, "final_video.mp4")
+            
+            # Cleanup
+            video.close()
+            for f in temp_files: os.remove(f)
+
+# Footer info
+st.sidebar.title("Project Settings")
+st.sidebar.markdown("---")
+st.sidebar.write(f"Total Clips: {len(st.session_state.segments)}")
+if st.sidebar.button("Reset Project"):
+    st.session_state.segments = []
+    st.session_state.video_path = None
+    st.rerun()
