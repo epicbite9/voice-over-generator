@@ -1,122 +1,291 @@
-import streamlit as st
-import google.generativeai as genai
-import tempfile
-import os
-import time
 import asyncio
-import edge_tts
+import json
+import os
 import re
-import moviepy.editor as mp
-from moviepy.video.VideoClip import ImageClip
+import tempfile
+import time
 
-st.set_page_config(page_title="Pro Tutorial Sync", layout="wide")
-st.title("🎬 Professional AI Tutorial Sync")
-st.markdown("Matching narration perfectly to on-screen actions using Freeze-Frame Sync.")
+import edge_tts
+import google.generativeai as genai
+import moviepy.editor as mp
+import streamlit as st
+
+
+CONFIG_PATH = ".tutorial_sync_config.json"
+OUTPUT_PATH = "pro_demo.mp4"
+
+
+st.set_page_config(page_title="Tutorial Sync Studio", layout="wide")
+
+st.markdown(
+    """
+<style>
+.block-container {padding-top: 1.25rem; padding-bottom: 2rem; max-width: 1100px;}
+[data-testid="stSidebar"] {background: linear-gradient(180deg, #f7fafc 0%, #e9f0f8 100%);}
+.hero {
+    background: linear-gradient(135deg, #0a2540 0%, #0f3b61 60%, #155987 100%);
+    color: #f8fbff;
+    border-radius: 14px;
+    padding: 1rem 1.1rem;
+    margin-bottom: 1rem;
+}
+.hero h1 {margin: 0 0 0.35rem 0; font-size: 1.55rem;}
+.hero p {margin: 0; opacity: 0.95;}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+st.markdown(
+    """
+<div class="hero">
+  <h1>Tutorial Sync Studio</h1>
+  <p>Generate narration and keep voice timing aligned with visual actions.</p>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        return {}
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(data):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
 
 def get_best_model(api_key):
     try:
         genai.configure(api_key=api_key)
         models = genai.list_models()
-        capable = [m.name for m in models if '1.5' in m.name and 'generateContent' in m.supported_generation_methods]
-        return capable[0] if capable else None
-    except: return None
+        capable = [
+            m.name
+            for m in models
+            if "generateContent" in getattr(m, "supported_generation_methods", [])
+            and "gemini" in m.name.lower()
+        ]
+        preferred = [m for m in capable if "1.5" in m or "2.0" in m or "2.5" in m]
+        return preferred[0] if preferred else (capable[0] if capable else None)
+    except Exception:
+        return None
+
 
 async def generate_segment_audio(text, output_path, voice):
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(output_path)
 
-# --- THE PRO ASSEMBLY ENGINE ---
+
+def parse_segments_from_response(raw_text):
+    text = raw_text.strip()
+    json_match = re.search(r"```json\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if json_match:
+        text = json_match.group(1).strip()
+
+    try:
+        payload = json.loads(text)
+        segments = payload.get("segments", payload) if isinstance(payload, (dict, list)) else []
+        out = []
+        for item in segments:
+            if not isinstance(item, dict):
+                continue
+            start = float(item.get("start", item.get("start_sec", 0)))
+            end = float(item.get("end", item.get("end_sec", 0)))
+            narration = str(item.get("narration", item.get("text", ""))).strip()
+            if narration:
+                out.append((start, end, narration))
+        return out
+    except Exception:
+        pass
+
+    pattern = r"\[(\d+):(\d+(?:\.\d+)?)\s*-\s*(\d+):(\d+(?:\.\d+)?)\]\s*Text:\s*(.*)"
+    matches = re.findall(pattern, raw_text)
+    out = []
+    for m in matches:
+        start_sec = int(m[0]) * 60 + float(m[1])
+        end_sec = int(m[2]) * 60 + float(m[3])
+        out.append((start_sec, end_sec, m[4].strip()))
+    return out
+
+
+def normalize_segments(script_data, video_duration):
+    cleaned = []
+    for start, end, text in script_data:
+        start = max(0.0, float(start))
+        end = min(float(end), float(video_duration))
+        if end <= start:
+            continue
+        txt = text.strip()
+        if txt:
+            cleaned.append((start, end, txt))
+
+    cleaned.sort(key=lambda x: x[0])
+    normalized = []
+    for idx, (start, end, text) in enumerate(cleaned):
+        next_start = cleaned[idx + 1][0] if idx + 1 < len(cleaned) else video_duration
+        end = min(end, next_start)
+        if end - start < 0.35:
+            continue
+        normalized.append((start, end, text))
+    return normalized
+
+
+def fit_video_to_audio(clip, audio_duration):
+    video_duration = clip.duration
+    delta = audio_duration - video_duration
+
+    if delta > 0.08:
+        freeze_frame = clip.get_frame(max(0.0, clip.duration - 0.02))
+        freeze_clip = mp.ImageClip(freeze_frame).set_duration(delta)
+        return mp.concatenate_videoclips([clip, freeze_clip])
+
+    if delta < -1.1:
+        target = max(audio_duration + 0.15, 0.25)
+        factor = video_duration / target
+        factor = min(factor, 1.8)
+        return clip.fx(mp.vfx.speedx, factor=factor)
+
+    return clip
+
+
 def assemble_pro_video(original_video_path, script_data, voice_choice):
     video = mp.VideoFileClip(original_video_path)
     segments = []
-    current_audio_time = 0
-    
-    for i, entry in enumerate(script_data):
-        start_t, end_t, text = entry
-        
-        # 1. Extract the specific video slice for this action
-        # Ensure we don't go out of bounds
-        end_t = min(end_t, video.duration)
-        clip = video.subclip(start_t, end_t)
-        
-        # 2. Generate audio for this specific slice
-        audio_seg_path = f"seg_{i}.mp3"
-        asyncio.run(generate_segment_audio(text, audio_seg_path, voice_choice))
-        audio_seg = mp.AudioFileClip(audio_seg_path)
-        
-        # 3. PRO SYNC LOGIC: 
-        # If audio is longer than video, freeze the last frame of the video
-        if audio_seg.duration > clip.duration:
-            freeze_duration = audio_seg.duration - clip.duration
-            last_frame = clip.get_frame(clip.duration - 0.01)
-            freeze_clip = mp.ImageClip(last_frame).set_duration(freeze_duration)
-            clip = mp.concatenate_videoclips([clip, freeze_clip])
-        else:
-            # If video is longer than audio, it plays normally (natural pauses)
-            clip = clip.set_duration(clip.duration)
-            
-        clip = clip.set_audio(audio_seg)
-        segments.append(clip)
-    
-    final_video = mp.concatenate_videoclips(segments, method="compose")
-    output_path = "pro_demo.mp4"
-    final_video.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=24)
-    return output_path
+    temp_audio_files = []
 
-# --- UI ---
+    try:
+        for i, entry in enumerate(script_data):
+            start_t, end_t, text = entry
+            if end_t <= start_t:
+                continue
+
+            clip = video.subclip(start_t, end_t)
+            audio_seg_path = f"seg_{i}.mp3"
+            asyncio.run(generate_segment_audio(text, audio_seg_path, voice_choice))
+            temp_audio_files.append(audio_seg_path)
+            audio_seg = mp.AudioFileClip(audio_seg_path)
+
+            clip = fit_video_to_audio(clip, audio_seg.duration)
+            clip = clip.set_audio(audio_seg)
+            segments.append(clip)
+
+        if not segments:
+            raise ValueError("No valid segments were produced.")
+
+        final_video = mp.concatenate_videoclips(segments, method="compose")
+        final_video.write_videofile(OUTPUT_PATH, codec="libx264", audio_codec="aac", fps=24)
+        final_video.close()
+        return OUTPUT_PATH
+    finally:
+        for p in temp_audio_files:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        video.close()
+
+
+stored = load_config()
+default_key = stored.get("gemini_api_key", "")
+
 with st.sidebar:
-    key = st.text_input("Gemini API Key", type="password")
-    voice = st.selectbox("Narrator Voice", ["en-US-GuyNeural", "en-US-AvaNeural", "en-GB-SoniaNeural"])
-    model_name = get_best_model(key) if key else None
+    st.subheader("Settings")
+    key = st.text_input("Gemini API Key", type="password", value=default_key)
+    save_key = st.checkbox("Remember API key on this computer", value=bool(default_key))
+    voice = st.selectbox(
+        "Narrator Voice",
+        ["en-US-GuyNeural", "en-US-AvaNeural", "en-GB-SoniaNeural", "en-US-JennyNeural"],
+    )
 
-uploaded_video = st.file_uploader("Upload Screen Recording", type=['mp4', 'mov'])
+    if key and save_key and key != default_key:
+        save_config({"gemini_api_key": key})
+    elif (not save_key) and default_key:
+        save_config({})
+
+    model_name = get_best_model(key) if key else None
+    if key and not model_name:
+        st.warning("No compatible Gemini model found for this key.")
+    elif model_name:
+        st.caption(f"Using model: `{model_name}`")
+
+
+col1, col2 = st.columns([1.5, 1])
+with col1:
+    uploaded_video = st.file_uploader("Upload Screen Recording", type=["mp4", "mov", "mkv"])
+with col2:
+    st.info(
+        "Tips for better sync:\n"
+        "- Use clear UI actions in the recording\n"
+        "- Keep video resolution readable\n"
+        "- Avoid long dead time between actions"
+    )
+
 
 if uploaded_video and key and model_name:
-    if st.button("Generate Professional Sync'd Demo"):
+    if st.button("Generate Professional Sync Demo", use_container_width=True):
         try:
-            with st.status("Analyzing & Syncing...") as status:
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
+            with st.status("Analyzing video and generating aligned narration...") as status:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
                     tmp.write(uploaded_video.read())
                     v_path = tmp.name
 
-                # A. Analysis with Time-Anchoring
-                st.write("Detecting exact timestamps for actions...")
+                base_video = mp.VideoFileClip(v_path)
+                duration = float(base_video.duration)
+                base_video.close()
+
+                st.write("1/3 Uploading video for scene analysis...")
                 genai_file = genai.upload_file(path=v_path)
-                while genai_file.state.name == "PROCESSING": time.sleep(2); genai_file = genai.get_file(genai_file.name)
-                
+                while genai_file.state.name == "PROCESSING":
+                    time.sleep(2)
+                    genai_file = genai.get_file(genai_file.name)
+
+                st.write("2/3 Creating structured timeline...")
                 model = genai.GenerativeModel(model_name=model_name)
-                # We force Gemini to use a specific format we can parse
-                prompt = """Analyze this video. Break it into segments based on visual actions.
-                For each segment, provide the start time, end time, and a professional narration sentence.
-                Format exactly like this:
-                [00:00 - 00:04] Text: Welcome to the dashboard.
-                [00:04 - 00:10] Text: Click on the media tab to see your files.
-                """
+                prompt = f"""
+Analyze this UI tutorial video and return JSON only.
+Requirements:
+- Split video into action-based segments.
+- Each segment has: start (seconds), end (seconds), narration.
+- Narration must fit naturally within each segment duration.
+- Cover the video from start to finish with no overlap.
+- Keep narration concise, professional, and tool-focused.
+- Total video duration is approximately {duration:.2f} seconds.
+
+Return format:
+{{
+  "segments": [
+    {{"start": 0.0, "end": 3.8, "narration": "..." }}
+  ]
+}}
+"""
                 response = model.generate_content([genai_file, prompt])
-                
-                # B. Parse the Timestamps
-                pattern = r"\[(\d+):(\d+)\s*-\s*(\d+):(\d+)\]\s*Text:\s*(.*)"
-                matches = re.findall(pattern, response.text)
-                
-                script_data = []
-                for m in matches:
-                    start_sec = int(m[0]) * 60 + int(m[1])
-                    end_sec = int(m[2]) * 60 + int(m[3])
-                    script_data.append((start_sec, end_sec, m[4]))
+                script_data = parse_segments_from_response(response.text)
+                script_data = normalize_segments(script_data, duration)
 
                 if not script_data:
-                    st.error("Failed to parse timestamps. Try again.")
+                    st.error("Could not parse action timestamps. Try a clearer recording.")
                     st.stop()
 
-                # C. Assemble
-                st.write(f"Syncing {len(script_data)} segments...")
+                st.write(f"3/3 Rendering final video from {len(script_data)} aligned segments...")
                 final_out = assemble_pro_video(v_path, script_data, voice)
-                status.update(label="Complete!", state="complete")
+                status.update(label="Complete", state="complete")
 
-            st.success("Professional Demo Created!")
+            st.success("Professional demo created successfully.")
             st.video(final_out)
             with open(final_out, "rb") as f:
-                st.download_button("Download Pro Demo", f, file_name="Professional_Sync.mp4")
+                st.download_button(
+                    "Download Final Video",
+                    f,
+                    file_name="professional_sync_demo.mp4",
+                    use_container_width=True,
+                )
 
         except Exception as e:
             st.error(f"Error: {e}")
