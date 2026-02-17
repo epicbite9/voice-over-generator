@@ -1,0 +1,7 @@
+streamlit
+google-generativeai
+moviepy==1.0.3
+edge-tts
+pillow
+numpy
+imageio-ffmpeg
