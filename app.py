@@ -15,6 +15,7 @@ import streamlit as st
 
 CONFIG_PATH = ".tutorial_sync_config.json"
 OUTPUT_PATH = "pro_demo.mp4"
+GAP_EPSILON = 0.20
 
 
 st.set_page_config(page_title="Tutorial Sync Studio", layout="wide")
@@ -206,22 +207,69 @@ def normalize_segments(script_data, video_duration):
     return normalized
 
 
-def fit_video_to_audio(clip, audio_duration):
-    video_duration = clip.duration
-    delta = audio_duration - video_duration
+def split_into_chunks(start, end, max_chunk=8.0):
+    chunks = []
+    cursor = start
+    while cursor < end - 0.05:
+        nxt = min(cursor + max_chunk, end)
+        chunks.append((cursor, nxt))
+        cursor = nxt
+    return chunks
 
-    if delta > 0.08:
+
+def coverage_ratio(script_data, video_duration):
+    if video_duration <= 0:
+        return 0.0
+    total = sum(max(0.0, end - start) for start, end, _ in script_data)
+    return min(1.0, total / video_duration)
+
+
+def ensure_full_coverage(script_data, video_duration):
+    if video_duration <= 0:
+        return []
+
+    base = normalize_segments(script_data, video_duration)
+    if not base:
+        base = [(0.0, video_duration, "In this step, follow the on-screen actions to continue the workflow.")]
+
+    full = []
+    cursor = 0.0
+    for start, end, text in base:
+        if start > cursor + GAP_EPSILON:
+            for gs, ge in split_into_chunks(cursor, start):
+                full.append((gs, ge, "Continue with the on-screen process and follow each visible action."))
+        full.append((max(cursor, start), end, text))
+        cursor = max(cursor, end)
+
+    if cursor < video_duration - GAP_EPSILON:
+        for gs, ge in split_into_chunks(cursor, video_duration):
+            full.append((gs, ge, "Complete the next visible steps shown in this part of the tutorial."))
+
+    adjusted = []
+    for start, end, text in full:
+        for cs, ce in split_into_chunks(start, end):
+            if ce - cs >= 0.35:
+                adjusted.append((cs, ce, text))
+    return adjusted
+
+
+def add_silence_padding(audio_clip, target_duration):
+    pad = target_duration - audio_clip.duration
+    if pad <= 0.05:
+        return audio_clip
+    silence = mp.AudioClip(lambda t: 0, duration=pad, fps=44100)
+    return mp.concatenate_audioclips([audio_clip, silence])
+
+
+def sync_clip_and_audio(clip, audio_clip):
+    if audio_clip.duration > clip.duration + 0.08:
+        freeze_duration = audio_clip.duration - clip.duration
         freeze_frame = clip.get_frame(max(0.0, clip.duration - 0.02))
-        freeze_clip = mp.ImageClip(freeze_frame).set_duration(delta)
-        return mp.concatenate_videoclips([clip, freeze_clip])
-
-    if delta < -1.1:
-        target = max(audio_duration + 0.15, 0.25)
-        factor = video_duration / target
-        factor = min(factor, 1.8)
-        return clip.fx(mp.vfx.speedx, factor=factor)
-
-    return clip
+        freeze_clip = mp.ImageClip(freeze_frame).set_duration(freeze_duration)
+        clip = mp.concatenate_videoclips([clip, freeze_clip], method="compose")
+    elif clip.duration > audio_clip.duration + 0.08:
+        audio_clip = add_silence_padding(audio_clip, clip.duration)
+    return clip, audio_clip
 
 
 def assemble_pro_video(original_video_path, script_data, voice_choice):
@@ -241,7 +289,7 @@ def assemble_pro_video(original_video_path, script_data, voice_choice):
             temp_audio_files.append(audio_seg_path)
             audio_seg = mp.AudioFileClip(audio_seg_path)
 
-            clip = fit_video_to_audio(clip, audio_seg.duration)
+            clip, audio_seg = sync_clip_and_audio(clip, audio_seg)
             clip = clip.set_audio(audio_seg)
             segments.append(clip)
 
@@ -336,7 +384,10 @@ Return format:
 """
                 response = model.generate_content([genai_file, prompt])
                 script_data = parse_segments_from_response(response.text)
-                script_data = normalize_segments(script_data, duration)
+                script_data = ensure_full_coverage(script_data, duration)
+                cov = coverage_ratio(script_data, duration)
+                if cov < 0.95:
+                    script_data = ensure_full_coverage([], duration)
 
                 if not script_data:
                     st.error("Could not parse action timestamps. Try a clearer recording.")
