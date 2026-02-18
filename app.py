@@ -18,10 +18,10 @@ os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
 
 # --- CONFIG ---
 CONFIG_PATH = ".tutorial_sync_config.json"
-OUTPUT_PATH = "creator_voiceover_final.mp4"
+OUTPUT_PATH = "tutor_voiceover_final.mp4"
 
 # --- UI THEME ---
-st.set_page_config(page_title="AI Creator Studio", layout="wide")
+st.set_page_config(page_title="AI Tutorial Studio", layout="wide")
 st.markdown("""
 <style>
     .stApp { background-color: #f8f9fa; color: #212529; }
@@ -66,7 +66,6 @@ def get_valid_model(api_key):
     except: return None
 
 async def generate_voice_file(text, path, voice):
-    # Standardizing voice rate for high quality
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(path)
 
@@ -78,20 +77,18 @@ def parse_ai_response(text):
         return data.get("segments", [])
     except: return []
 
-# --- CREATOR ENGINE (Anti-Overlap Logic) ---
+# --- TUTOR ENGINE ---
 def assemble_composition(video_path, segments, voice):
     render_id = str(uuid.uuid4())[:8]
-    work_dir = os.path.join(tempfile.gettempdir(), f"creator_{render_id}")
+    work_dir = os.path.join(tempfile.gettempdir(), f"tutor_{render_id}")
     os.makedirs(work_dir, exist_ok=True)
     
     video_clip = mp.VideoFileClip(video_path).without_audio()
     v_dur = video_clip.duration
     
-    # Sort by start time to handle sequence logic
     sorted_segs = sorted(segments, key=lambda x: x['start'])
-    
     final_audio_clips = []
-    last_audio_end_time = 0.0 # Track when the previous audio ends to prevent overlap
+    last_audio_end_time = 0.0 
     
     for i, seg in enumerate(sorted_segs):
         if not seg['narration'].strip(): continue
@@ -101,15 +98,12 @@ def assemble_composition(video_path, segments, voice):
         
         if os.path.exists(seg_mp3) and os.path.getsize(seg_mp3) > 0:
             a_clip = mp.AudioFileClip(seg_mp3)
-            
-            # ANTI-OVERLAP LOGIC: 
-            # If the current clip starts before the previous one finished, 
-            # we shift it slightly to prevent the "Double Voice/Echo" effect.
             start_time = float(seg['start'])
-            if start_time < last_audio_end_time:
-                start_time = last_audio_end_time + 0.1 # Add a tiny 100ms gap
             
-            # Ensure we don't exceed video length
+            # Anti-Overlap: Ensure segments don't talk over each other
+            if start_time < last_audio_end_time:
+                start_time = last_audio_end_time + 0.15
+            
             if start_time < v_dur:
                 a_clip = a_clip.set_start(start_time)
                 final_audio_clips.append(a_clip)
@@ -129,7 +123,6 @@ def assemble_composition(video_path, segments, voice):
         temp_audiofile=os.path.join(work_dir, "audio.m4a"), remove_temp=True
     )
 
-    # Cleanup memory handles
     final_video.close()
     video_clip.close()
     for ac in final_audio_clips: ac.close()
@@ -139,19 +132,19 @@ def assemble_composition(video_path, segments, voice):
     return OUTPUT_PATH
 
 # --- UI ---
-st.title("👨‍💻 AI Creator Narrator")
-st.markdown("##### The AI speaks as you, the creator, in first-person active voice.")
+st.title("🎓 AI Tutor Narrator")
+st.markdown("##### The AI acts as a teacher, giving direct instructions to your visitors.")
 
 stored = load_config()
 with st.sidebar:
     st.header("⚙️ Settings")
     api_key = st.text_input("Gemini API Key", type="password", value=stored.get("api_key", ""))
     voice = st.selectbox("Narrator Voice", ["en-US-AndrewMultilingualNeural", "en-US-JennyNeural", "en-US-GuyNeural", "en-GB-SoniaNeural"])
-    if st.button("Save"): save_config({"api_key": api_key})
+    if st.button("Save Settings"): save_config({"api_key": api_key})
 
 # LAYER 1
-st.markdown('<div class="layer-container video-label"><h3>Layer 1: Silent Footage</h3></div>', unsafe_allow_html=True)
-up = st.file_uploader("Video", type=["mp4", "mov"], label_visibility="collapsed")
+st.markdown('<div class="layer-container video-label"><h3>Layer 1: Tutorial Video</h3></div>', unsafe_allow_html=True)
+up = st.file_uploader("Import silent video", type=["mp4", "mov"], label_visibility="collapsed")
 if up:
     if st.session_state.video_path is None or up.name != st.session_state.get('last_fn'):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as t:
@@ -163,28 +156,35 @@ if up:
     st.video(st.session_state.video_path)
 
 # LAYER 2
-st.markdown('<div class="layer-container audio-label"><h3>Layer 2: Personal Narration Layer</h3></div>', unsafe_allow_html=True)
-if st.button("✨ Generate My Creator Script") and st.session_state.video_path:
+st.markdown('<div class="layer-container audio-label"><h3>Layer 2: Instructional Voice Layer</h3></div>', unsafe_allow_html=True)
+if st.button("✨ Generate Tutorial Instructions") and st.session_state.video_path:
     if api_key:
-        with st.spinner("AI is thinking as the creator..."):
+        with st.spinner("AI is crafting the tutorial..."):
             m = genai.GenerativeModel(get_valid_model(api_key))
             vf = genai.upload_file(path=st.session_state.video_path)
             while vf.state.name == "PROCESSING": time.sleep(2); vf = genai.get_file(vf.name)
             
-            # --- THE PERSONA PROMPT FIX ---
+            # --- THE TUTORIAL PERSONA PROMPT ---
             prompt = f"""
-            You are the person who recorded this video. You are the CREATOR and NARRATOR.
-            Analyze the video and write a narration script.
+            You are a professional TEACHER and TUTOR. 
+            Analyze the video and write a narration script to guide a VISITOR through the steps.
             
-            RULES:
-            1. Use FIRST-PERSON ACTIVE VOICE only. (e.g., "I'm clicking here", "I navigate to...", "Let me show you how I...")
-            2. DO NOT use passive voice. (e.g., Avoid "The button is clicked" or "Now it is opened")
-            3. Act as the teacher. Use "I" and "We".
-            4. Total video duration: {st.session_state.video_duration} seconds.
-            5. Spread the segments throughout the whole video.
+            STRICT PERSONA RULES:
+            1. Use the SECOND-PERSON ("You") and IMPERATIVE MOOD (Commands).
+            2. TEACH the viewer. Say "Click on...", "Navigate to...", "You can see that...".
+            3. DO NOT describe your own actions. Never say "I am doing X" or "I click Y".
+            4. Use "Next, you want to..." or "Go ahead and click...".
+            5. Address the visitor as "You". Example: "First, navigate to your WordPress dashboard."
+            6. Total duration: {st.session_state.video_duration} seconds.
+            
+            Example of GOOD style:
+            "In this video, I'll show you how you can install the plugin. First, go to Plugins and then click Add New."
+            
+            Example of BAD style:
+            "In this video, I'm going to show you how I install the plugin. First, I go to Plugins..."
             
             Return JSON only:
-            {{ "segments": [ {{ "start": 0.0, "end": 4.0, "narration": "In this video, I'm going to show you my workflow..." }} ] }}
+            {{ "segments": [ {{ "start": 0.0, "end": 5.0, "narration": "..." }} ] }}
             """
             
             res = m.generate_content([vf, prompt])
@@ -194,17 +194,17 @@ if st.button("✨ Generate My Creator Script") and st.session_state.video_path:
 if st.session_state.segments:
     for i, seg in enumerate(st.session_state.segments):
         with st.container():
-            st.markdown(f'<div class="segment-box"><b>Segment {i+1}</b>', unsafe_allow_html=True)
+            st.markdown(f'<div class="segment-box"><b>Instruction {i+1}</b>', unsafe_allow_html=True)
             c1, c2, c3 = st.columns([1, 1, 4])
-            st.session_state.segments[i]['start'] = c1.number_input("At(s)", value=float(seg['start']), key=f"s_{i}")
+            st.session_state.segments[i]['start'] = c1.number_input("Time(s)", value=float(seg['start']), key=f"s_{i}")
             st.session_state.segments[i]['end'] = c2.number_input("To(s)", value=float(seg['end']), key=f"e_{i}")
-            st.session_state.segments[i]['narration'] = c3.text_area("My Script", value=seg['narration'], key=f"n_{i}")
+            st.session_state.segments[i]['narration'] = c3.text_area("Tutor Script", value=seg['narration'], key=f"n_{i}")
             if st.button(f"Remove {i+1}", key=f"del_{i}"): st.session_state.segments.pop(i); st.rerun()
 
 # RENDER
 if st.session_state.video_path and st.session_state.segments:
-    if st.button("🚀 Render My Masterpiece", type="primary", use_container_width=True):
-        with st.status("Ensuring no overlaps and clear voice..."):
+    if st.button("🚀 Render Tutorial Video", type="primary", use_container_width=True):
+        with st.status("Assembling tutorial layers..."):
             path = assemble_composition(st.session_state.video_path, st.session_state.segments, voice)
         st.video(path)
-        with open(path, "rb") as f: st.download_button("💾 Download", f, "creator_export.mp4")
+        with open(path, "rb") as f: st.download_button("💾 Download Tutorial", f, "tutorial_export.mp4")
