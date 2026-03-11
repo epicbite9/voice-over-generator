@@ -58,7 +58,6 @@ def load_config():
 def save_config(data):
     json.dump(data, open(CONFIG_PATH, "w"), indent=2)
 
-# RESTORED: Your original automatic model detection logic
 def get_valid_model(api_key):
     try:
         genai.configure(api_key=api_key)
@@ -69,6 +68,7 @@ def get_valid_model(api_key):
 
 # --- PREMIUM SYNC ENGINE ---
 async def generate_synced_voice(text, path, voice, target_duration):
+    # First attempt: Normal speed
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(path)
     
@@ -76,6 +76,7 @@ async def generate_synced_voice(text, path, voice, target_duration):
     actual_dur = audio.duration
     audio.close()
     
+    # 5% buffer for natural breathing room
     safety_target = target_duration * 0.95
     
     if actual_dur > safety_target:
@@ -88,23 +89,12 @@ async def generate_synced_voice(text, path, voice, target_duration):
         communicate = edge_tts.Communicate(text, voice, rate="-10%")
         await communicate.save(path)
 
-# FIXED: Now normalizes JSON keys so 'narration' always exists
 def parse_ai_response(text):
     try:
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match: return []
         data = json.loads(match.group())
-        raw_segments = data.get("segments", [])
-        
-        # Ensure the 'narration' key is present even if AI names it differently
-        normalized_segments = []
-        for s in raw_segments:
-            normalized_segments.append({
-                "start": float(s.get("start", 0.0)),
-                "end": float(s.get("end", 5.0)),
-                "narration": str(s.get("narration") or s.get("text") or s.get("script") or "")
-            })
-        return normalized_segments
+        return data.get("segments", [])
     except: return []
 
 def assemble_composition(video_path, segments, voice):
@@ -120,19 +110,18 @@ def assemble_composition(video_path, segments, voice):
     last_audio_end = 0.0
 
     for i, seg in enumerate(sorted_segs):
-        # Safety check for narration key
-        text = seg.get('narration', '')
-        if not text.strip(): continue
+        if not seg['narration'].strip(): continue
         
         seg_mp3 = os.path.join(work_dir, f"seg_{i}.mp3")
         target_dur = max(1.0, float(seg['end']) - float(seg['start']))
         
-        asyncio.run(generate_synced_voice(text, seg_mp3, voice, target_dur))
+        asyncio.run(generate_synced_voice(seg['narration'], seg_mp3, voice, target_dur))
         
         if os.path.exists(seg_mp3) and os.path.getsize(seg_mp3) > 0:
             a_clip = mp.AudioFileClip(seg_mp3)
             start_time = float(seg['start'])
             
+            # Anti-Overlap Logic
             if start_time < last_audio_end:
                 start_time = last_audio_end + 0.1
             
@@ -170,13 +159,6 @@ stored = load_config()
 with st.sidebar:
     st.header("⚙️ Settings")
     api_key = st.text_input("Gemini API Key", type="password", value=stored.get("api_key", ""))
-    
-    # Reset trigger if API key changes (prevents keys from clashing with old data)
-    if "prev_key" not in st.session_state: st.session_state.prev_key = api_key
-    if api_key != st.session_state.prev_key:
-        st.session_state.segments = []
-        st.session_state.prev_key = api_key
-
     voice = st.selectbox("Narrator Voice", ["en-US-AndrewMultilingualNeural", "en-US-JennyNeural", "en-US-GuyNeural", "en-GB-SoniaNeural"])
     if st.button("Save Settings"): save_config({"api_key": api_key})
 
@@ -199,12 +181,7 @@ if st.button("✨ Generate Synced Tutor Script") and st.session_state.video_path
     if api_key:
         with st.spinner("AI is analyzing..."):
             try:
-                model_name = get_valid_model(api_key) # AUTO DETECTION
-                if not model_name:
-                    st.error("Invalid API Key or no compatible models found.")
-                    st.stop()
-                
-                m = genai.GenerativeModel(model_name)
+                m = genai.GenerativeModel(get_valid_model(api_key))
                 vf = genai.upload_file(path=st.session_state.video_path)
                 while vf.state.name == "PROCESSING": time.sleep(2); vf = genai.get_file(vf.name)
                 
@@ -222,41 +199,20 @@ if st.button("✨ Generate Synced Tutor Script") and st.session_state.video_path
                 st.rerun()
                 
             except exceptions.ResourceExhausted:
-                st.error("🚨 API Limit Reached: Please wait about 60 seconds before trying again.")
+                st.error("🚨 API Limit Reached: Please wait about 60 seconds before trying again. Your daily quota or per-minute limit has been exhausted.")
             except Exception as e:
                 st.error(f"An error occurred: {e}")
 
-# FIXED: Safety checks added to the display loop to prevent KeyError
+# Display Segments
 if st.session_state.segments:
-    for i in range(len(st.session_state.segments)):
-        # Ensure the dictionary has the 'narration' key before rendering
-        if 'narration' not in st.session_state.segments[i]:
-            st.session_state.segments[i]['narration'] = ""
-            
+    for i, seg in enumerate(st.session_state.segments):
         with st.container():
             st.markdown(f'<div class="segment-box"><b>Instruction {i+1}</b>', unsafe_allow_html=True)
             c1, c2, c3 = st.columns([1, 1, 4])
-            
-            # Use value= to ensure number inputs handle floats correctly
-            st.session_state.segments[i]['start'] = c1.number_input(
-                "Start(s)", 
-                value=float(st.session_state.segments[i].get('start', 0.0)), 
-                key=f"s_{i}"
-            )
-            st.session_state.segments[i]['end'] = c2.number_input(
-                "End(s)", 
-                value=float(st.session_state.segments[i].get('end', 5.0)), 
-                key=f"e_{i}"
-            )
-            st.session_state.segments[i]['narration'] = c3.text_area(
-                "Script", 
-                value=st.session_state.segments[i].get('narration', ''), 
-                key=f"n_{i}"
-            )
-            
-            if st.button(f"Remove {i+1}", key=f"del_{i}"): 
-                st.session_state.segments.pop(i)
-                st.rerun()
+            st.session_state.segments[i]['start'] = c1.number_input("Start(s)", value=float(seg['start']), key=f"s_{i}")
+            st.session_state.segments[i]['end'] = c2.number_input("End(s)", value=float(seg['end']), key=f"e_{i}")
+            st.session_state.segments[i]['narration'] = c3.text_area("Script", value=seg['narration'], key=f"n_{i}")
+            if st.button(f"Remove {i+1}", key=f"del_{i}"): st.session_state.segments.pop(i); st.rerun()
 
 # RENDER
 if st.session_state.video_path and st.session_state.segments:
