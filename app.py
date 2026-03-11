@@ -53,75 +53,59 @@ if 'video_duration' not in st.session_state: st.session_state.video_duration = 0
 
 # --- HELPERS ---
 def load_config():
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r") as f:
-                return json.load(f)
-        except: return {}
-    return {}
+    return json.load(open(CONFIG_PATH, "r")) if os.path.exists(CONFIG_PATH) else {}
 
 def save_config(data):
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(data, f, indent=2)
+    json.dump(data, open(CONFIG_PATH, "w"), indent=2)
 
+# RESTORED: Your original automatic model detection logic
 def get_valid_model(api_key):
     try:
         genai.configure(api_key=api_key)
         models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        # Prefer flash for speed, then pro
         preferred = [m for m in models if "1.5-flash" in m]
-        if not preferred:
-            preferred = [m for m in models if "1.5-pro" in m]
-        return preferred[0] if preferred else "gemini-1.5-flash"
-    except Exception as e:
-        return "gemini-1.5-flash"
+        return preferred[0] if preferred else models[0]
+    except: return None
 
 # --- PREMIUM SYNC ENGINE ---
 async def generate_synced_voice(text, path, voice, target_duration):
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(path)
     
-    try:
-        audio = mp.AudioFileClip(path)
-        actual_dur = audio.duration
-        audio.close()
-        
-        safety_target = target_duration * 0.95
-        
-        if actual_dur > safety_target:
-            speed_factor = (actual_dur / safety_target) - 1.0
-            rate_percent = int(speed_factor * 100)
-            rate_str = f"+{min(rate_percent, 50)}%" 
-            communicate = edge_tts.Communicate(text, voice, rate=rate_str)
-            await communicate.save(path)
-        elif actual_dur < (target_duration * 0.5):
-            communicate = edge_tts.Communicate(text, voice, rate="-10%")
-            await communicate.save(path)
-    except:
-        pass # Fallback to original audio if analysis fails
+    audio = mp.AudioFileClip(path)
+    actual_dur = audio.duration
+    audio.close()
+    
+    safety_target = target_duration * 0.95
+    
+    if actual_dur > safety_target:
+        speed_factor = (actual_dur / safety_target) - 1.0
+        rate_percent = int(speed_factor * 100)
+        rate_str = f"+{min(rate_percent, 50)}%" 
+        communicate = edge_tts.Communicate(text, voice, rate=rate_str)
+        await communicate.save(path)
+    elif actual_dur < (target_duration * 0.5):
+        communicate = edge_tts.Communicate(text, voice, rate="-10%")
+        await communicate.save(path)
 
+# FIXED: Now normalizes JSON keys so 'narration' always exists
 def parse_ai_response(text):
     try:
-        # Find JSON block
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match: return []
-        
         data = json.loads(match.group())
         raw_segments = data.get("segments", [])
         
-        cleaned_segments = []
+        # Ensure the 'narration' key is present even if AI names it differently
+        normalized_segments = []
         for s in raw_segments:
-            # SAFETY: Ensure every segment has 'narration' even if AI uses 'text' or 'script'
-            narration = s.get("narration") or s.get("text") or s.get("script") or ""
-            cleaned_segments.append({
+            normalized_segments.append({
                 "start": float(s.get("start", 0.0)),
                 "end": float(s.get("end", 5.0)),
-                "narration": str(narration)
+                "narration": str(s.get("narration") or s.get("text") or s.get("script") or "")
             })
-        return cleaned_segments
-    except Exception as e:
-        st.error(f"Parsing error: {e}")
-        return []
+        return normalized_segments
+    except: return []
 
 def assemble_composition(video_path, segments, voice):
     render_id = str(uuid.uuid4())[:8]
@@ -136,18 +120,19 @@ def assemble_composition(video_path, segments, voice):
     last_audio_end = 0.0
 
     for i, seg in enumerate(sorted_segs):
-        if not seg.get('narration', '').strip(): continue
+        # Safety check for narration key
+        text = seg.get('narration', '')
+        if not text.strip(): continue
         
         seg_mp3 = os.path.join(work_dir, f"seg_{i}.mp3")
         target_dur = max(1.0, float(seg['end']) - float(seg['start']))
         
-        asyncio.run(generate_synced_voice(seg['narration'], seg_mp3, voice, target_dur))
+        asyncio.run(generate_synced_voice(text, seg_mp3, voice, target_dur))
         
         if os.path.exists(seg_mp3) and os.path.getsize(seg_mp3) > 0:
             a_clip = mp.AudioFileClip(seg_mp3)
             start_time = float(seg['start'])
             
-            # Anti-Overlap Logic
             if start_time < last_audio_end:
                 start_time = last_audio_end + 0.1
             
@@ -186,17 +171,14 @@ with st.sidebar:
     st.header("⚙️ Settings")
     api_key = st.text_input("Gemini API Key", type="password", value=stored.get("api_key", ""))
     
-    # Reset segments if API key changes to prevent mismatch
-    if "current_key" not in st.session_state:
-        st.session_state.current_key = api_key
-    if api_key != st.session_state.current_key:
+    # Reset trigger if API key changes (prevents keys from clashing with old data)
+    if "prev_key" not in st.session_state: st.session_state.prev_key = api_key
+    if api_key != st.session_state.prev_key:
         st.session_state.segments = []
-        st.session_state.current_key = api_key
+        st.session_state.prev_key = api_key
 
     voice = st.selectbox("Narrator Voice", ["en-US-AndrewMultilingualNeural", "en-US-JennyNeural", "en-US-GuyNeural", "en-GB-SoniaNeural"])
-    if st.button("Save Settings"): 
-        save_config({"api_key": api_key})
-        st.success("Settings saved!")
+    if st.button("Save Settings"): save_config({"api_key": api_key})
 
 # LAYER 1: VIDEO
 st.markdown('<div class="layer-container video-label"><h3>Layer 1: Tutorial Footage</h3></div>', unsafe_allow_html=True)
@@ -204,8 +186,7 @@ up = st.file_uploader("Video", type=["mp4", "mov"], label_visibility="collapsed"
 if up:
     if st.session_state.video_path is None or up.name != st.session_state.get('last_fn'):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as t:
-            t.write(up.getbuffer()); 
-            st.session_state.video_path = t.name
+            t.write(up.getbuffer()); st.session_state.video_path = t.name
             st.session_state['last_fn'] = up.name
         v = mp.VideoFileClip(st.session_state.video_path)
         st.session_state.video_duration = v.duration
@@ -216,55 +197,47 @@ if up:
 st.markdown('<div class="layer-container audio-label"><h3>Layer 2: Sync-Corrected Narration</h3></div>', unsafe_allow_html=True)
 if st.button("✨ Generate Synced Tutor Script") and st.session_state.video_path:
     if api_key:
-        with st.spinner("AI is analyzing the video..."):
+        with st.spinner("AI is analyzing..."):
             try:
-                model_name = get_valid_model(api_key)
+                model_name = get_valid_model(api_key) # AUTO DETECTION
+                if not model_name:
+                    st.error("Invalid API Key or no compatible models found.")
+                    st.stop()
+                
                 m = genai.GenerativeModel(model_name)
                 vf = genai.upload_file(path=st.session_state.video_path)
-                
-                # Wait for processing
-                while vf.state.name == "PROCESSING":
-                    time.sleep(2)
-                    vf = genai.get_file(vf.name)
+                while vf.state.name == "PROCESSING": time.sleep(2); vf = genai.get_file(vf.name)
                 
                 prompt = f"""
-                You are a professional TUTOR. Write a narration script for this video.
+                You are a professional TUTOR. Write a narration script guiding the visitor.
                 Address the visitor as "You". Never use "I".
-                Match segments to visual changes.
-                Video Duration: {st.session_state.video_duration} seconds.
-                
-                IMPORTANT: Return ONLY valid JSON in this format:
-                {{ "segments": [ {{ "start": 0.0, "end": 4.5, "narration": "Your text here" }} ] }}
+                Match segments exactly to the visual changes.
+                Duration: {st.session_state.video_duration}s.
+                Return JSON only:
+                {{ "segments": [ {{ "start": 0.0, "end": 4.5, "narration": "..." }} ] }}
                 """
                 
                 res = m.generate_content([vf, prompt])
-                parsed = parse_ai_response(res.text)
-                if parsed:
-                    st.session_state.segments = parsed
-                    st.rerun()
-                else:
-                    st.error("AI returned an invalid format. Please try again.")
+                st.session_state.segments = parse_ai_response(res.text)
+                st.rerun()
                 
             except exceptions.ResourceExhausted:
-                st.error("🚨 API Limit Reached (Quota full for this key). Please wait 60s or try a different key.")
+                st.error("🚨 API Limit Reached: Please wait about 60 seconds before trying again.")
             except Exception as e:
                 st.error(f"An error occurred: {e}")
-    else:
-        st.warning("Please enter an API Key in the sidebar first.")
 
-# Display and Edit Segments
+# FIXED: Safety checks added to the display loop to prevent KeyError
 if st.session_state.segments:
-    # Use a copy to iterate to avoid issues when popping items
     for i in range(len(st.session_state.segments)):
-        # Ensure keys exist before rendering
+        # Ensure the dictionary has the 'narration' key before rendering
         if 'narration' not in st.session_state.segments[i]:
             st.session_state.segments[i]['narration'] = ""
             
         with st.container():
-            st.markdown(f'<div class="segment-box"><b>Segment {i+1}</b>', unsafe_allow_html=True)
+            st.markdown(f'<div class="segment-box"><b>Instruction {i+1}</b>', unsafe_allow_html=True)
             c1, c2, c3 = st.columns([1, 1, 4])
             
-            # Use .get() and value= for safer data binding
+            # Use value= to ensure number inputs handle floats correctly
             st.session_state.segments[i]['start'] = c1.number_input(
                 "Start(s)", 
                 value=float(st.session_state.segments[i].get('start', 0.0)), 
@@ -281,19 +254,14 @@ if st.session_state.segments:
                 key=f"n_{i}"
             )
             
-            if st.button(f"Remove Segment {i+1}", key=f"del_{i}"):
+            if st.button(f"Remove {i+1}", key=f"del_{i}"): 
                 st.session_state.segments.pop(i)
                 st.rerun()
 
 # RENDER
 if st.session_state.video_path and st.session_state.segments:
     if st.button("🚀 Render Premium Synced Video", type="primary", use_container_width=True):
-        with st.status("Syncing audio and rendering final video..."):
-            try:
-                path = assemble_composition(st.session_state.video_path, st.session_state.segments, voice)
-                st.success("Render complete!")
-                st.video(path)
-                with open(path, "rb") as f: 
-                    st.download_button("💾 Download Synced Tutorial", f, "tutorial_pro.mp4")
-            except Exception as e:
-                st.error(f"Render failed: {e}")
+        with st.status("Calculating speed sync and rendering..."):
+            path = assemble_composition(st.session_state.video_path, st.session_state.segments, voice)
+        st.video(path)
+        with open(path, "rb") as f: st.download_button("💾 Download Synced Tutorial", f, "tutorial_pro.mp4")
